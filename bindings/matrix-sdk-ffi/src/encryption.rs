@@ -457,6 +457,53 @@ pub async fn database_contains_secrets_bundle(
     })
 }
 
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum RoomKeyImportExportError {
+    #[error("Wrong passphrase")]
+    WrongPassphrase,
+
+    #[error("Invalid key export file: {msg}")]
+    InvalidFile { msg: String },
+
+    #[error("I/O error: {msg}")]
+    Io { msg: String },
+
+    #[error("Unexpected error: {msg}")]
+    Other { msg: String },
+}
+
+impl From<matrix_sdk::Error> for RoomKeyImportExportError {
+    fn from(e: matrix_sdk::Error) -> Self {
+        Self::Other { msg: e.to_string() }
+    }
+}
+
+impl From<matrix_sdk::encryption::RoomKeyImportError> for RoomKeyImportExportError {
+    fn from(e: matrix_sdk::encryption::RoomKeyImportError) -> Self {
+        use matrix_sdk::encryption::RoomKeyImportError as E;
+        match e {
+            E::Io(io_err) => Self::Io { msg: io_err.to_string() },
+            E::Export(export_err) => {
+                use matrix_sdk_crypto::KeyExportError as KE;
+                match export_err {
+                    KE::InvalidMac => Self::WrongPassphrase,
+                    KE::InvalidHeaders | KE::UnsupportedVersion => {
+                        Self::InvalidFile { msg: export_err.to_string() }
+                    }
+                    other => Self::InvalidFile { msg: other.to_string() },
+                }
+            }
+            other => Self::Other { msg: other.to_string() },
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct RoomKeyImportSummary {
+    pub imported_count: u64,
+    pub total_count: u64,
+}
+
 #[matrix_sdk_ffi_macros::export]
 impl Encryption {
     /// Get the public ed25519 key of our own device. This is usually what is
@@ -486,6 +533,33 @@ impl Encryption {
 
     pub fn backup_state(&self) -> BackupState {
         self.inner.backups().state().into()
+    }
+
+    pub async fn export_room_keys(
+        &self,
+        path: String,
+        mut passphrase: String,
+    ) -> Result<(), RoomKeyImportExportError> {
+        let result = self
+            .inner
+            .export_room_keys(path.into(), &passphrase, |_| true)
+            .await;
+        passphrase.zeroize();
+        Ok(result?)
+    }
+
+    pub async fn import_room_keys(
+        &self,
+        path: String,
+        mut passphrase: String,
+    ) -> Result<RoomKeyImportSummary, RoomKeyImportExportError> {
+        let result = self.inner.import_room_keys(path.into(), &passphrase).await;
+        passphrase.zeroize();
+        let r = result?;
+        Ok(RoomKeyImportSummary {
+            imported_count: r.imported_count as u64,
+            total_count: r.total_count as u64,
+        })
     }
 
     /// Does a backup exist on the server?
